@@ -423,7 +423,7 @@ func (s *MessageSuite) TestReverseRoute() {
 
 	builder := s.msg.reverseRoute()
 
-	var testCases = []struct {
+	testCases := []struct {
 		tag           Tag
 		expectedValue string
 	}{
@@ -503,6 +503,37 @@ func (s *MessageSuite) TestCopyIntoMessage() {
 	s.True(dest.IsMsgTypeOf("D"))
 	s.Equal(dest.String(), renderedString)
 	s.Equal(string(dest.Bytes()), renderedString)
+}
+
+func (s *MessageSuite) TestRebuildOneRepeatingGroupWithJsonWithDictionary() {
+	dict, dictErr := datadictionary.Parse("spec/FIX44.xml")
+	s.Nil(dictErr)
+
+	// Given message bytes from a valid string with a 453 repeating group.
+	rawMsg := bytes.NewBufferString(
+		"8=FIX.4.49=16535=D34=249=0100150=01001a52=20231231-20:19:4156=TEST" +
+			"1=acct111=1397621=138=140=244=1254=155=SYMABC59=060=20231231-20:19:41453=1448=4501447=D452=28" +
+			"10=026")
+
+	// When we parse it into a message
+	s.Nil(ParseMessageWithDataDictionary(s.msg, rawMsg, dict, dict))
+
+	// And then convert to json
+	json, err := s.msg.ToJSON(dict)
+	s.Nil(err)
+
+	// And then rebuild the message bytes
+	dest := NewMessage()
+	err = dest.FromJSON(json, dict, dict)
+	s.Nil(err)
+	rebuildBytes := dest.build()
+	expectedBytes := []byte(
+		"8=FIX.4.49=16535=D34=249=0100150=01001a52=20231231-20:19:4156=TEST" +
+			"1=acct111=1397621=138=140=244=1254=155=SYMABC59=060=20231231-20:19:41453=1448=4501447=D452=28" +
+			"10=026")
+
+	// Then the bytes should have repeating groups properly ordered
+	s.True(bytes.Equal(expectedBytes, rebuildBytes), "Unexpected bytes,\n expected: %s\n but got: %s", expectedBytes, rebuildBytes)
 }
 
 func checkFieldInt(s *MessageSuite, fields FieldMap, tag, expected int) {

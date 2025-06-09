@@ -17,6 +17,8 @@ package quickfix
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -42,7 +44,7 @@ type msgParser struct {
 
 // in the message header, the first 3 tags in the message header must be 8,9,35.
 func headerFieldOrdering(i, j Tag) bool {
-	var ordering = func(t Tag) uint32 {
+	ordering := func(t Tag) uint32 {
 		switch t {
 		case tagBeginString:
 			return 1
@@ -617,4 +619,152 @@ func (m *Message) cook() {
 	m.Header.SetInt(tagBodyLength, bodyLength)
 	checkSum := (m.Header.total() + m.Body.total() + m.Trailer.total()) % 256
 	m.Trailer.SetString(tagCheckSum, formatCheckSum(checkSum))
+}
+
+func (m *Message) fieldMapToJson(sb *bytes.Buffer, dd *datadictionary.DataDictionary, fields *FieldMap) error {
+	var numInGroupFieldList []*datadictionary.FieldType
+	tags := fields.sortedTags()
+	for i, tag := range tags {
+		if tag == tagCheckSum {
+			continue
+		}
+		if isNumInGroupField(m, []Tag{tag}, dd) {
+			ft, ok := dd.FieldTypeByTag[int(tag)]
+			if !ok {
+				return errors.New(fmt.Sprintf("could not find field info for tag %v", tag))
+			}
+			numInGroupFieldList = append(numInGroupFieldList, ft)
+			continue
+		}
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		var fieldvalue FIXString
+		msgerr := fields.GetField(tag, &fieldvalue)
+		if msgerr != nil {
+			return msgerr
+		}
+		ft, ok := dd.FieldTypeByTag[int(tag)]
+		if !ok {
+			return errors.New(fmt.Sprintf("could not find field info for tag %v", tag))
+		}
+		value := fieldvalue.String()
+		if len(ft.Enums) > 0 {
+			enum, ok := ft.Enums[value]
+			if ok {
+				value = enum.Description
+			}
+		}
+		sb.WriteString(fmt.Sprintf("\"%v\": \"%v\"", ft.Name(), value))
+	}
+
+	if len(numInGroupFieldList) > 0 {
+		sb.WriteString(",")
+	}
+
+	for i, ft := range numInGroupFieldList {
+		fd := getGroupFields(m, []Tag{Tag(ft.Tag())}, dd)
+		tmpl := GroupTemplate{}
+		for _, d := range fd {
+			tmpl = append(tmpl, GroupElement(Tag(d.Tag())))
+		}
+		repGroup := NewRepeatingGroup(Tag(ft.Tag()), tmpl)
+		msgerr := fields.GetGroup(repGroup)
+		if msgerr != nil {
+			return msgerr
+		}
+		sb.WriteString(fmt.Sprintf("\"%v\": [", ft.Name()))
+		for o, g := range repGroup.groups {
+			sb.WriteString("{")
+			err := m.fieldMapToJson(sb, dd, &g.FieldMap)
+			if err != nil {
+				return err
+			}
+			sb.WriteString("}")
+			if o < len(repGroup.groups)-1 {
+				sb.WriteString(",")
+			}
+		}
+		sb.WriteString("]")
+		if i < len(numInGroupFieldList)-1 {
+			sb.WriteString(",")
+		}
+	}
+
+	return nil
+}
+
+func (m *Message) ToJSON(dd *datadictionary.DataDictionary) ([]byte, error) {
+	sb := bytes.NewBufferString("")
+	sb.WriteString("{")
+	sb.WriteString("\"Header\":{")
+	err := m.fieldMapToJson(sb, dd, &m.Header.FieldMap)
+	if err != nil {
+		return nil, err
+	}
+	sb.WriteString("},\"Body\":{")
+	err = m.fieldMapToJson(sb, dd, &m.Body.FieldMap)
+	if err != nil {
+		return nil, err
+	}
+	sb.WriteString("},\"Trailer\":{")
+	err = m.fieldMapToJson(sb, dd, &m.Trailer.FieldMap)
+	if err != nil {
+		return nil, err
+	}
+	sb.WriteString("}}")
+	s := sb.String()
+
+	return []byte(s), nil
+}
+
+func (m *Message) fromJsonFieldMap(sb *bytes.Buffer, dd *datadictionary.DataDictionary, fields map[string]interface{}) error {
+	for k, v := range fields {
+		ft, ok := dd.FieldTypeByName[k]
+		if !ok {
+			return errors.New(fmt.Sprintf("%v not defined in app datadictionary", k))
+		}
+		if isNumInGroupField(m, []Tag{Tag(ft.Tag())}, dd) {
+			groups := v.(map[string]interface{})
+			sb.WriteString(fmt.Sprintf("%v=%v\001", ft.Tag(), len(groups)))
+			for _, g := range groups {
+				m.fromJsonFieldMap(sb, dd, g.(map[string]interface{}))
+			}
+			continue
+		}
+		value := v
+		for ek, ev := range ft.Enums {
+			if ev.Description == v {
+				value = ek
+				break
+			}
+		}
+		sb.WriteString(fmt.Sprintf("%v=%v\001", ft.Tag(), value))
+	}
+
+	return nil
+}
+
+func (m *Message) FromJSON(
+	document []byte,
+	transportDataDictionary *datadictionary.DataDictionary,
+	appDataDictionary *datadictionary.DataDictionary,
+) error {
+	var jm interface{}
+	sb := bytes.NewBufferString("")
+	err := json.Unmarshal(document, &jm)
+	if err != nil {
+		return err
+	}
+	topDoc := jm.(map[string]interface{})
+
+	header := topDoc["Header"].(map[string]interface{})
+	m.fromJsonFieldMap(sb, appDataDictionary, header)
+	body := topDoc["Body"].(map[string]interface{})
+	m.fromJsonFieldMap(sb, appDataDictionary, body)
+	trailer := topDoc["Trailer"].(map[string]interface{})
+	m.fromJsonFieldMap(sb, appDataDictionary, trailer)
+
+	ParseMessageWithDataDictionary(m, sb, transportDataDictionary, appDataDictionary)
+	return nil
 }
