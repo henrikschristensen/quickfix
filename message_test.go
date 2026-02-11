@@ -453,7 +453,7 @@ func (s *MessageSuite) TestReverseRoute() {
 
 	builder := s.msg.reverseRoute()
 
-	var testCases = []struct {
+	testCases := []struct {
 		tag           Tag
 		expectedValue string
 	}{
@@ -533,6 +533,24 @@ func (s *MessageSuite) TestCopyIntoMessage() {
 	s.True(dest.IsMsgTypeOf("D"))
 	s.Equal(dest.String(), renderedString)
 	s.Equal(string(dest.Bytes()), renderedString)
+}
+
+func (s *MessageSuite) TestBuildFromJsonStringWithDictionary() {
+	dict, dictErr := datadictionary.Parse("spec/FIX44.xml")
+	s.Nil(dictErr)
+
+	// Given message bytes from a valid string with a 453 repeating group that has 2 child groups.
+	rawMsg := bytes.NewBufferString("{\"Header\":{\"BeginString\":\"FIX.4.4\",\"BodyLength\":\"202\",\"MsgType\":\"35\"},\"Body\":{\"TransactTime\":\"20230101-10:00:00\",\"Account\":\"ACCOUNT123\",\"ClOrdID\":\"ORDER-001\",\"HandlInst\":\"1\",\"Price\":\"100.50\",\"Symbol\":\"AAPL\",\"NoPartyIDs\":[{\"PartyID\":\"BROKER1\",\"PartyIDSource\":\"D\",\"PartyRole\":\"1\"},{\"PartyID\":\"CLIENT1\",\"PartyIDSource\":\"D\",\"PartyRole\":\"2\"}],\"NoTradingSessions\":[{\"TradingSessionID\":\"SESSION1\",\"TradingSessionSubID\":\"SUB1\",\"TradSesStatus\":\"1\"},{\"TradingSessionID\":\"SESSION2\",\"TradingSessionSubID\":\"SUB2\",\"TradSesStatus\":\"2\"}],\"OrderQty\":\"100\",\"OrdType\":\"2\",\"Side\":\"1\",\"TimeInForce\":\"0\"},\"Trailer\":{\"CheckSum\":\"44\"}}")
+
+	// When we parse it into a message
+	s.Nil(s.msg.FromJSON(rawMsg.Bytes(), dict, dict))
+
+	// And then rebuild the message bytes
+	rebuildBytes := s.msg.build()
+	expectedBytes := []byte("8=FIX.4.49=15035=351=ACCOUNT12311=ORDER-00121=138=10040=244=100.5054=155=AAPL59=060=20230101-10:00:00336=SESSION2340=2447=D448=CLIENT1452=2625=SUB210=099")
+
+	// Then the bytes should have repeating groups properly ordered
+	s.True(bytes.Equal(expectedBytes, rebuildBytes), "Unexpected bytes,\n expected: %s\n but got: %s", expectedBytes, rebuildBytes)
 }
 
 func checkFieldInt(s *MessageSuite, fields FieldMap, tag, expected int) {

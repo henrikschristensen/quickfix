@@ -17,10 +17,15 @@ package quickfix
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
+	"sort"
+	"strconv"
 	"time"
 
+	"github.com/karlseguin/jsonwriter"
 	"github.com/quickfixgo/quickfix/datadictionary"
 )
 
@@ -42,7 +47,7 @@ type msgParser struct {
 
 // in the message header, the first 3 tags in the message header must be 8,9,35.
 func headerFieldOrdering(i, j Tag) bool {
-	var ordering = func(t Tag) uint32 {
+	ordering := func(t Tag) uint32 {
 		switch t {
 		case tagBeginString:
 			return 1
@@ -617,4 +622,188 @@ func (m *Message) cook(bodyLen, bodyTotal int) {
 	m.Header.SetInt(tagBodyLength, bodyLength)
 	checkSum := (m.Header.total() + bodyTotal + m.Trailer.total()) % 256
 	m.Trailer.SetString(tagCheckSum, formatCheckSum(checkSum))
+}
+
+func (m *Message) ToJSON(humanReadable bool, dd *datadictionary.DataDictionary) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	writer := jsonwriter.New(buf)
+
+	var err error = nil
+	writer.RootObject(func() {
+		writer.Object("Header", func() {
+			err = m.Header.ToJSON(writer, humanReadable, dd)
+			if err != nil {
+				return
+			}
+		})
+		writer.Object("Body", func() {
+			err = m.Body.ToJSON(writer, humanReadable, dd)
+			if err != nil {
+				return
+			}
+		})
+		writer.Object("Trailer", func() {
+			err = m.Trailer.ToJSON(writer, humanReadable, dd)
+			if err != nil {
+				return
+			}
+		})
+	})
+
+	return buf.Bytes(), nil
+}
+
+func unpackArray(s any) []any {
+	v := reflect.ValueOf(s)
+	r := make([]any, v.Len())
+	for i := 0; i < v.Len(); i++ {
+		r[i] = v.Index(i).Interface()
+	}
+	return r
+}
+
+func (m *Message) FromJSON(j []byte, appDict *datadictionary.DataDictionary, transDict *datadictionary.DataDictionary) error {
+	var sb bytes.Buffer
+	var fields map[string]any
+	if err := json.Unmarshal(j, &fields); err != nil {
+		return err
+	}
+
+	h, err := findTag("Header", fields)
+	if err != nil {
+		return err
+	}
+	// Use fromJSONHeader for header to ensure proper field ordering (8, 9, 35 first)
+	if err = fromJSONHeader(&sb, h.(map[string]any), appDict); err != nil {
+		return err
+	}
+
+	b, err := findTag("Body", fields)
+	if err != nil {
+		return err
+	}
+	if err = fromJSON(&sb, b.(map[string]any), appDict); err != nil {
+		return err
+	}
+
+	t, err := findTag("Trailer", fields)
+	if err != nil {
+		return err
+	}
+	if err = fromJSON(&sb, t.(map[string]any), appDict); err != nil {
+		return err
+	}
+
+	if appDict != nil && transDict != nil {
+		ParseMessageWithDataDictionary(m, &sb, transDict, appDict)
+	} else {
+		ParseMessage(m, &sb)
+	}
+
+	return nil
+}
+
+func findTag(t string, fields map[string]any) (any, error) {
+	for n, v := range fields {
+		if n == t {
+			return v, nil
+		}
+	}
+
+	return nil, fmt.Errorf("cannot find field %v", t)
+}
+
+func fromJSON(sb *bytes.Buffer, fields map[string]any, dict *datadictionary.DataDictionary) error {
+	for name, field := range fields {
+		var fieldName string
+		ft, ok := dict.FieldTypeByName[name]
+		if !ok {
+			nn, err := strconv.Atoi(name)
+			if err != nil {
+				return fmt.Errorf("field with name %v is not in dictionary, and cannot be parsed to field number", err)
+			}
+			fieldName = strconv.Itoa(nn)
+		} else {
+			fieldName = strconv.Itoa(ft.Tag())
+		}
+		rt := reflect.TypeOf(field)
+		switch rt.Kind() {
+		case reflect.Slice:
+			arr := unpackArray(field)
+			for _, av := range arr {
+				if err := fromJSON(sb, av.(map[string]any), dict); err != nil {
+					return err
+				}
+			}
+		default:
+			fmt.Fprintf(sb, "%v=%v\u0001", fieldName, field)
+		}
+	}
+
+	return nil
+}
+
+// fromJSONHeader is a specialized version of fromJSON for header fields that ensures
+// fields 8, 9, and 35 are written first in the correct order.
+func fromJSONHeader(sb *bytes.Buffer, fields map[string]any, dict *datadictionary.DataDictionary) error {
+	// Extract all fields with their tags
+	type fieldInfo struct {
+		tag   Tag
+		name  string
+		value any
+	}
+
+	var fieldInfos []fieldInfo
+	for name, field := range fields {
+		var tag Tag
+		ft, ok := dict.FieldTypeByName[name]
+		if !ok {
+			nn, err := strconv.Atoi(name)
+			if err != nil {
+				return fmt.Errorf("field with name %v is not in dictionary, and cannot be parsed to field number", err)
+			}
+			tag = Tag(nn)
+		} else {
+			tag = Tag(ft.Tag())
+		}
+		fieldInfos = append(fieldInfos, fieldInfo{
+			tag:   tag,
+			name:  name,
+			value: field,
+		})
+	}
+
+	// Sort fields using headerFieldOrdering
+	sort.Slice(fieldInfos, func(i, j int) bool {
+		return headerFieldOrdering(fieldInfos[i].tag, fieldInfos[j].tag)
+	})
+
+	// Write fields in sorted order
+	for _, fi := range fieldInfos {
+		var fieldName string
+		if dict != nil {
+			if ft, ok := dict.FieldTypeByTag[int(fi.tag)]; ok {
+				fieldName = strconv.Itoa(ft.Tag())
+			} else {
+				fieldName = strconv.Itoa(int(fi.tag))
+			}
+		} else {
+			fieldName = strconv.Itoa(int(fi.tag))
+		}
+
+		rt := reflect.TypeOf(fi.value)
+		switch rt.Kind() {
+		case reflect.Slice:
+			arr := unpackArray(fi.value)
+			for _, av := range arr {
+				if err := fromJSON(sb, av.(map[string]any), dict); err != nil {
+					return err
+				}
+			}
+		default:
+			fmt.Fprintf(sb, "%v=%v\u0001", fieldName, fi.value)
+		}
+	}
+
+	return nil
 }

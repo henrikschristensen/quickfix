@@ -17,9 +17,15 @@ package quickfix
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/karlseguin/jsonwriter"
+	"github.com/quickfixgo/quickfix/datadictionary"
 )
 
 // field stores a slice of TagValues.
@@ -411,4 +417,89 @@ func (m FieldMap) length() int {
 	}
 
 	return length
+}
+
+func (m *FieldMap) ToJSON(writer *jsonwriter.Writer, humanReadable bool, dict *datadictionary.DataDictionary) error {
+	if humanReadable && dict == nil {
+		return errors.New("Dictionary must not be nil to produce human readable output")
+	}
+
+	m.rwLock.RLock()
+	defer m.rwLock.RUnlock()
+
+	for _, tag := range m.Tags() {
+		fields := m.tagLookup[tag]
+		if len(fields) > 1 {
+			err := m.toJSONGroup(writer, humanReadable, dict, tag)
+			if err != nil {
+				return err
+			}
+		} else {
+			fieldName := strconv.Itoa(int(tag))
+			if humanReadable {
+				fieldType, ok := dict.FieldTypeByTag[int(tag)]
+				if ok {
+					fieldName = fieldType.Name()
+				}
+			}
+			writer.KeyString(fieldName, string(fields[0].value))
+		}
+	}
+
+	return nil
+}
+
+func (m *FieldMap) toJSONGroup(w *jsonwriter.Writer, humanReadable bool, dict *datadictionary.DataDictionary, tag Tag) error {
+	if humanReadable && dict == nil {
+		return errors.New("Dictionary must not be nil to produce human readable output")
+	}
+
+	groupCount, err := m.GetInt(tag)
+	if err != nil {
+		return err
+	}
+
+	fields := m.tagLookup[tag]
+	numFields := len(fields) - 1
+	groupLength := int(numFields / groupCount)
+	if numFields%groupLength > 0 {
+		return fmt.Errorf("cannot parse group %v. Expected %v fields but found %v", tag, groupLength*groupCount, numFields)
+	}
+
+	groupName := strconv.Itoa(int(tag))
+	if humanReadable {
+		fieldType, ok := dict.FieldTypeByTag[int(tag)]
+		if ok {
+			groupName = fieldType.Name()
+		}
+	}
+
+	var vErr error = nil
+	w.Array(groupName, func() {
+		for c := range groupCount {
+			w.ArrayObject(func() {
+				for ic := range groupLength {
+					f := fields[c*groupLength+ic+1]
+					mf := m.tagLookup[f.tag]
+					if len(mf) > 1 {
+						fm := FieldMap{}
+						fm.init()
+						fm.add(mf)
+						vErr = m.toJSONGroup(w, humanReadable, dict, f.tag)
+					} else {
+						memberName := strconv.Itoa(int(f.tag))
+						if dict != nil {
+							ift, ok := dict.FieldTypeByTag[int(f.tag)]
+							if ok {
+								memberName = ift.Name()
+							}
+						}
+						w.KeyString(memberName, string(f.value))
+					}
+				}
+			})
+		}
+	})
+
+	return vErr
 }
